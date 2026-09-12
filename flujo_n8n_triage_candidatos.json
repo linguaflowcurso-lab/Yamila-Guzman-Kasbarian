@@ -1,0 +1,321 @@
+{
+  "name": "Triage Automático de Candidatos por CV",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "simple": false,
+        "filters": {
+          "sender": "",
+          "q": "to:cv@tuempresa.com has:attachment newer_than:1d"
+        },
+        "options": { "downloadAttachments": true }
+      },
+      "id": "1a1a1a1a-0001",
+      "name": "Trigger: Nuevo CV (Gmail - From now on)",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1,
+      "position": [-1200, 300],
+      "notes": "Escucha SOLO mails nuevos a partir del deploy (From now on). Evita reprocesar el historial y consumo masivo de operaciones."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.attachments.length}}",
+              "rightValue": 0,
+              "operator": { "type": "number", "operation": "gt" }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{$json.subject}}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "1a1a1a1a-0002",
+      "name": "Filtro: Datos mínimos completos",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-960, 300],
+      "notes": "Camino infeliz: si falta el adjunto o el asunto (puesto aplicado), no se crea el registro como 'Nuevo' sino como 'Error' — evita basura en la DB."
+    },
+    {
+      "parameters": {
+        "operation": "extractText",
+        "binaryPropertyName": "attachment_0"
+      },
+      "id": "1a1a1a1a-0003",
+      "name": "Extraer texto del CV (PDF)",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [-720, 220],
+      "notes": "Convierte el adjunto PDF/DOCX a texto plano para mandarlo al modelo."
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "value": "appXXXXXXXXXXXXXX" },
+        "table": { "value": "Candidatos" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Nombre": "={{$('Trigger: Nuevo CV (Gmail - From now on)').item.json.from.name}}",
+            "Email": "={{$('Trigger: Nuevo CV (Gmail - From now on)').item.json.from.address}}",
+            "Puesto_Aplicado": "={{$('Trigger: Nuevo CV (Gmail - From now on)').item.json.subject}}",
+            "CV_Texto": "={{$json.text}}",
+            "Estado": "Nuevo",
+            "Fecha_Ingreso": "={{$now.toISO()}}"
+          }
+        }
+      },
+      "id": "1a1a1a1a-0004",
+      "name": "Airtable: Crear registro (Estado=Nuevo)",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2,
+      "position": [-480, 220],
+      "notes": "El registro nace en Airtable ANTES de llamar a la IA: si algo falla después, ya queda evidencia del ingreso."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "value": "appXXXXXXXXXXXXXX" },
+        "table": { "value": "Candidatos" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{$json.id}}",
+            "Estado": "Error",
+            "Error_Log": "Datos incompletos: falta adjunto de CV o asunto con el puesto aplicado."
+          }
+        }
+      },
+      "id": "1a1a1a1a-0005",
+      "name": "Airtable: Registrar Error (datos incompletos)",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2,
+      "position": [-720, 420],
+      "notes": "Rama del camino infeliz. No corta el flujo global: solo cierra esta ejecución dejando registro del motivo."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"claude-sonnet-4-6\",\n  \"max_tokens\": 500,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Sos un analista de RRHH. Puesto: {{$('Airtable: Crear registro (Estado=Nuevo)').item.json.fields.Puesto_Aplicado}}. CV del candidato: {{$('Airtable: Crear registro (Estado=Nuevo)').item.json.fields.CV_Texto}}. Devolvé SOLO un JSON válido, sin texto adicional, con esta forma exacta: {\\\"score\\\": <numero 0-100>, \\\"categoria\\\": \\\"Alta|Media|Baja\\\", \\\"justificacion\\\": \\\"<2-3 lineas>\\\"}\"\n    }\n  ]\n}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "1a1a1a1a-0006",
+      "name": "IA: Evaluar fit candidato-puesto (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-240, 220],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "notes": "Prompt dinámico: usa las variables reales del registro (puesto y CV), nunca datos hardcodeados. onError=continueErrorOutput + 2 reintentos: si la API falla, el flujo sigue por la rama de error en vez de cortarse."
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.content[0].text;\nlet parsed;\ntry {\n  parsed = JSON.parse(raw);\n} catch (e) {\n  parsed = { score: 0, categoria: 'Error', justificacion: 'No se pudo parsear la respuesta del modelo.' };\n}\nreturn [{ json: parsed }];"
+      },
+      "id": "1a1a1a1a-0007",
+      "name": "Parsear JSON de respuesta IA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-120, 140],
+      "notes": "Mismo patrón usado en la Pre-Entrega 5: la respuesta del modelo llega como string anidado y hay que parsearla a objeto."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "value": "appXXXXXXXXXXXXXX" },
+        "table": { "value": "Candidatos" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{$('Airtable: Crear registro (Estado=Nuevo)').item.json.id}}",
+            "Score_IA": "={{$json.score}}",
+            "Categoria": "={{$json.categoria}}",
+            "Justificacion_IA": "={{$json.justificacion}}",
+            "Estado": "Procesado_IA",
+            "Fecha_Procesado": "={{$now.toISO()}}"
+          }
+        }
+      },
+      "id": "1a1a1a1a-0008",
+      "name": "Airtable: Actualizar con resultado IA",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2,
+      "position": [120, 140],
+      "notes": "Estado pasa a Procesado_IA. Único punto de escritura del resultado del modelo."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "value": "appXXXXXXXXXXXXXX" },
+        "table": { "value": "Candidatos" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{$('Airtable: Crear registro (Estado=Nuevo)').item.json.id}}",
+            "Estado": "Error",
+            "Error_Log": "={{$json.error?.message || 'Falló la llamada a la API de IA tras 2 reintentos.'}}"
+          }
+        }
+      },
+      "id": "1a1a1a1a-0009",
+      "name": "Airtable: Registrar Error (falla de API)",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2,
+      "position": [-120, 340],
+      "notes": "Rama de error del nodo HTTP Request. El sistema queda estable: nada se pierde, todo queda trazado en Airtable."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.fields.Categoria}}",
+              "rightValue": "Alta",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "1a1a1a1a-0010",
+      "name": "IF: ¿Categoría = Alta?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [360, 140],
+      "notes": "Solo los candidatos de prioridad Alta requieren aprobación humana antes de contactarlos; Media/Baja quedan registrados para revisión batch semanal (fuera del alcance de este flujo)."
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "value": "#rrhh-triage" },
+        "text": "=🟢 *Candidato Alta Prioridad*\\nNombre: {{$json.fields.Nombre}}\\nPuesto: {{$json.fields.Puesto_Aplicado}}\\nScore IA: {{$json.fields.Score_IA}}\\nJustificación: {{$json.fields.Justificacion_IA}}\\n\\nResponder *Aprobado* o *Rechazado* en este canal para continuar.",
+        "otherOptions": {}
+      },
+      "id": "1a1a1a1a-0011",
+      "name": "Slack: Notificar para aprobación (HITL)",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [600, 60],
+      "notes": "Punto de Human-in-the-loop obligatorio: el flujo NO contacta al candidato sin esta aprobación explícita."
+    },
+    {
+      "parameters": {
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "channel": "#rrhh-triage"
+      },
+      "id": "1a1a1a1a-0012",
+      "name": "Trigger: Respuesta de RRHH en Slack",
+      "type": "n8n-nodes-base.slackTrigger",
+      "typeVersion": 1,
+      "position": [840, 60],
+      "notes": "Segundo disparador: escucha la respuesta humana ('Aprobado'/'Rechazado') y retoma el flujo de ese candidato."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "value": "appXXXXXXXXXXXXXX" },
+        "table": { "value": "Candidatos" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{$json.candidateRecordId}}",
+            "Estado": "={{$json.text.toLowerCase().includes('aprobado') ? 'Aprobado' : 'Rechazado'}}"
+          }
+        }
+      },
+      "id": "1a1a1a1a-0013",
+      "name": "Airtable: Registrar decisión humana",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2,
+      "position": [1080, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{$json.fields.Estado}}",
+              "rightValue": "Aprobado",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "id": "1a1a1a1a-0014",
+      "name": "IF: ¿Aprobado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1320, 60]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{$json.fields.Email}}",
+        "subject": "Novedades sobre tu postulación a {{$json.fields.Puesto_Aplicado}}",
+        "message": "=Hola {{$json.fields.Nombre}},\\n\\nGracias por tu interés en la posición de {{$json.fields.Puesto_Aplicado}}. Tu perfil avanzó a la siguiente etapa de nuestro proceso de selección; en breve te contactaremos para coordinar los próximos pasos.\\n\\nSaludos,\\nEquipo de RRHH",
+        "options": {}
+      },
+      "id": "1a1a1a1a-0015",
+      "name": "Gmail: Responder al candidato (auto)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1560, 60],
+      "notes": "Único punto de salida al candidato, y solo se dispara si Estado=Aprobado. Cierra el ciclo end-to-end sin intervención manual adicional."
+    }
+  ],
+  "connections": {
+    "Trigger: Nuevo CV (Gmail - From now on)": { "main": [[{ "node": "Filtro: Datos mínimos completos", "type": "main", "index": 0 }]] },
+    "Filtro: Datos mínimos completos": {
+      "main": [
+        [{ "node": "Extraer texto del CV (PDF)", "type": "main", "index": 0 }],
+        [{ "node": "Airtable: Registrar Error (datos incompletos)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Extraer texto del CV (PDF)": { "main": [[{ "node": "Airtable: Crear registro (Estado=Nuevo)", "type": "main", "index": 0 }]] },
+    "Airtable: Crear registro (Estado=Nuevo)": { "main": [[{ "node": "IA: Evaluar fit candidato-puesto (Claude)", "type": "main", "index": 0 }]] },
+    "IA: Evaluar fit candidato-puesto (Claude)": {
+      "main": [
+        [{ "node": "Parsear JSON de respuesta IA", "type": "main", "index": 0 }],
+        [{ "node": "Airtable: Registrar Error (falla de API)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parsear JSON de respuesta IA": { "main": [[{ "node": "Airtable: Actualizar con resultado IA", "type": "main", "index": 0 }]] },
+    "Airtable: Actualizar con resultado IA": { "main": [[{ "node": "IF: ¿Categoría = Alta?", "type": "main", "index": 0 }]] },
+    "IF: ¿Categoría = Alta?": { "main": [[{ "node": "Slack: Notificar para aprobación (HITL)", "type": "main", "index": 0 }], []] },
+    "Slack: Notificar para aprobación (HITL)": { "main": [[{ "node": "Trigger: Respuesta de RRHH en Slack", "type": "main", "index": 0 }]] },
+    "Trigger: Respuesta de RRHH en Slack": { "main": [[{ "node": "Airtable: Registrar decisión humana", "type": "main", "index": 0 }]] },
+    "Airtable: Registrar decisión humana": { "main": [[{ "node": "IF: ¿Aprobado?", "type": "main", "index": 0 }]] },
+    "IF: ¿Aprobado?": { "main": [[{ "node": "Gmail: Responder al candidato (auto)", "type": "main", "index": 0 }], []] }
+  },
+  "meta": {
+    "caso_de_uso": "Triage automático de candidatos por CV",
+    "autor": "Yamila Guzman Kasbarian",
+    "notas": "Blueprint de referencia para la Entrega Final. Reemplazar appXXXXXXXXXXXXXX por el Base ID real de Airtable y configurar credenciales de Gmail, Slack y Anthropic (httpHeaderAuth con x-api-key) antes de activar."
+  }
+}
